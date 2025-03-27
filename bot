@@ -1,0 +1,225 @@
+import asyncio
+import aiohttp
+import json
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.transaction import VersionedTransaction
+import time
+import tweepy
+import base64
+
+# Configuration (placeholders for your keys)
+config = {
+    "x_api_key": "YOUR_X_API_KEY",
+    "x_api_secret": "YOUR_X_API_SECRET",
+    "x_access_token": "YOUR_X_ACCESS_TOKEN",
+    "x_access_secret": "YOUR_X_ACCESS_SECRET",
+    "birdeye_api_key": "YOUR_BIRDEYE_API_KEY",
+    "solana_rpc": "https://api.devnet.solana.com",  # Devnet RPC
+    "wallet_private_key": "YOUR_WALLET_PRIVATE_KEY",
+    "jupiter_quote_api": "https://quote-api.jup.ag/v6/quote",
+    "jupiter_swap_api": "https://quote-api.jup.ag/v6/swap",
+}
+
+# Top CT Influencers
+CT_INFLUENCERS = [
+    "TheMoonCarl", "CryptoWendyO", "cz_binance", "VitalikButerin", "saylor",
+    "elonmusk", "LarkDavis", "EllioTrades", "AltcoinGordon", "Trader_Jibon"
+]
+
+# Authenticate with X API
+auth = tweepy.OAuth1UserHandler(
+    config["x_api_key"], config["x_api_secret"],
+    config["x_access_token"], config["x_access_secret"]
+)
+x_api = tweepy.API(auth)
+
+# Global trade tracking
+trade_state = {}
+
+# Agent 1: Price Monitor with X Sentiment and Sell Logic
+async def price_monitor(token_address, input_mint="So11111111111111111111111111111111111111112"):  # SOL as input
+    async with aiohttp.ClientSession() as session:
+        price_history = []
+        wallet = Keypair.from_seed(bytes.fromhex(config["wallet_private_key"]))
+
+        while True:
+            price_data = await get_birdeye_data(session, token_address, "price")
+            liquidity_data = await get_birdeye_data(session, token_address, "liquidity")
+            token_info = await get_birdeye_data(session, token_address, "token_info")
+            if not all([price_data, liquidity_data, token_info]):
+                await asyncio.sleep(15)
+                continue
+
+            current_price = price_data["data"]["value"]
+            current_volume = price_data["data"].get("volume", 0)
+            current_liquidity = liquidity_data["data"].get("liquidity", 0)
+            timestamp = int(time.time())
+            creation_time = token_info["data"].get("created_timestamp", timestamp)
+
+            price_history.append({"timestamp": timestamp, "price": current_price, "volume": current_volume})
+            price_history = [x for x in price_history if timestamp - x["timestamp"] <= 3600]
+
+            if len(price_history) < 4:
+                print(f"[{time.strftime('%H:%M:%S')}] Collecting data: Price ${current_price}")
+                await asyncio.sleep(15)
+                continue
+
+            # Buy conditions
+            oldest_price = price_history[0]["price"]
+            price_increase = current_price / oldest_price
+            price_condition = price_increase >= 1.5
+
+            recent_volume = price_history[-1]["volume"]
+            avg_volume = sum(x["volume"] for x in price_history[:-1]) / (len(price_history) - 1)
+            volume_condition = recent_volume >= 3 * avg_volume if avg_volume > 0 else False
+
+            liquidity_condition = current_liquidity >= 10_000
+            age_condition = (timestamp - creation_time) <= 7 * 24 * 3600
+
+            sentiment_score, mention_count = await check_x_sentiment(token_address)
+            sentiment_condition = sentiment_score > 0 and mention_count >= 3
+
+            print(f"[{time.strftime('%H:%M:%S')}] Price: ${current_price}, Volume: {recent_volume}, Liquidity: ${current_liquidity}, Mentions: {mention_count}")
+
+            # Check buy condition
+            if all([price_condition, volume_condition, liquidity_condition, age_condition, sentiment_condition]) and token_address not in trade_state:
+                print(f"Entry conditions met! Price up {price_increase:.2f}x, Sentiment: {sentiment_score}")
+                token_amount = await trigger_trade(current_price, wallet, token_address, input_mint, is_buy=True)
+                if token_amount:
+                    trade_state[token_address] = {
+                        "buy_price": current_price,
+                        "initial_amount": token_amount,
+                        "remaining_amount": token_amount,
+                        "sold_20": False,
+                        "sold_60": False
+                    }
+
+            # Check sell conditions
+            if token_address in trade_state:
+                state = trade_state[token_address]
+                buy_price = state["buy_price"]
+                remaining_amount = state["remaining_amount"]
+                profit_20_target = buy_price * 1.20  # 20% profit
+                profit_60_target = buy_price * 1.60  # 60% profit
+                loss_50_target = buy_price * 0.50   # 50% loss
+
+                # Sell 50% at 20% profit
+                if current_price >= profit_20_target and not state["sold_20"] and remaining_amount > 0:
+                    sell_amount = state["initial_amount"] // 2  # 50% of initial
+                    await trigger_trade(current_price, wallet, token_address, input_mint, is_buy=False, amount=sell_amount)
+                    state["remaining_amount"] -= sell_amount
+                    state["sold_20"] = True
+                    print(f"Sold 50% at 20% profit: {sell_amount} tokens, Remaining: {state['remaining_amount']}")
+
+                # Sell 30% at 60% profit
+                elif current_price >= profit_60_target and not state["sold_60"] and remaining_amount > 0:
+                    sell_amount = int(state["initial_amount"] * 0.30)  # 30% of initial
+                    await trigger_trade(current_price, wallet, token_address, input_mint, is_buy=False, amount=sell_amount)
+                    state["remaining_amount"] -= sell_amount
+                    state["sold_60"] = True
+                    print(f"Sold 30% at 60% profit: {sell_amount} tokens, Remaining: {state['remaining_amount']} (Moon bag)")
+
+                # Sell all at 50% loss
+                elif current_price <= loss_50_target and remaining_amount > 0:
+                    sell_amount = state["remaining_amount"]  # Sell all remaining
+                    await trigger_trade(current_price, wallet, token_address, input_mint, is_buy=False, amount=sell_amount)
+                    state["remaining_amount"] = 0
+                    print(f"Sold all at 50% loss: {sell_amount} tokens")
+                    del trade_state[token_address]  # Clear state
+
+                # Clear if fully sold
+                if state["remaining_amount"] <= 0 and (state["sold_20"] or state["sold_60"]):
+                    del trade_state[token_address]
+
+            await asyncio.sleep(15)
+
+async def get_birdeye_data(session, token_address, endpoint_type):
+    endpoints = {
+        "price": f"https://public-api.birdeye.so/v1/price?address={token_address}&network=devnet",
+        "liquidity": f"https://public-api.birdeye.so/v1/pools?address={token_address}&network=devnet",
+        "token_info": f"https://public-api.birdeye.so/v1/token?address={token_address}&network=devnet"
+    }
+    url = endpoints.get(endpoint_type)
+    if not url:
+        return None
+    headers = {"X-API-KEY": config["birdeye_api_key"]}
+    async with session.get(url, headers=headers) as resp:
+        return await resp.json() if resp.status == 200 else None
+
+async def check_x_sentiment(token_address):
+    query = f"{token_address} OR {token_address[:6]} -filter:retweets"
+    tweets = x_api.search_tweets(q=query, count=50, lang="en", tweet_mode="extended")
+    
+    mention_count = 0
+    sentiment_score = 0
+    positive_keywords = ["pump", "bullish", "moon", "buy", "up"]
+    negative_keywords = ["dump", "bearish", "sell", "down", "scam"]
+
+    for tweet in tweets:
+        if any(influencer in tweet.user.screen_name for influencer in CT_INFLUENCERS):
+            mention_count += 1
+            text = tweet.full_text.lower()
+            if any(word in text for word in positive_keywords):
+                sentiment_score += 1
+            if any(word in text for word in negative_keywords):
+                sentiment_score -= 1
+
+    return sentiment_score, mention_count
+
+# Agent 2: Trade Executor with Jupiter API (Buy and Sell)
+async def trigger_trade(current_price, wallet, token_address, input_mint, is_buy=True, amount=None):
+    async with aiohttp.ClientSession() as session:
+        if is_buy:
+            input_mint_trade = input_mint  # SOL
+            output_mint = token_address
+            trade_amount = 1_000_000_000  # 1 SOL in lamports
+        else:
+            input_mint_trade = token_address
+            output_mint = input_mint  # SOL
+            trade_amount = amount  # Token amount to sell
+
+        # Get quote from Jupiter
+        quote_params = {
+            "inputMint": input_mint_trade,
+            "outputMint": output_mint,
+            "amount": trade_amount,
+            "slippageBps": 5000  # 50% slippage
+        }
+        async with session.get(config["jupiter_quote_api"], params=quote_params) as resp:
+            if resp.status != 200:
+                print(f"Failed to get quote: {await resp.text()}")
+                return None
+            quote_response = await resp.json()
+
+        # Build swap transaction
+        swap_params = {
+            "userPublicKey": str(wallet.pubkey()),
+            "quoteResponse": quote_response,
+            "wrapAndUnwrapSol": True
+        }
+        async with session.post(config["jupiter_swap_api"], json=swap_params) as resp:
+            if resp.status != 200:
+                print(f"Failed to get swap: {await resp.text()}")
+                return None
+            swap_response = await resp.json()
+            swap_transaction = swap_response["swapTransaction"]
+
+        # Execute swap on Devnet
+        async with AsyncClient(config["solana_rpc"]) as client:
+            raw_tx = base64.b64decode(swap_transaction)
+            tx = VersionedTransaction.from_bytes(raw_tx)
+            tx.sign([wallet])
+            tx_id = await client.send_raw_transaction(bytes(tx))
+            print(f"{'Buy' if is_buy else 'Sell'} executed: Price ${current_price}, TX ID: {tx_id}")
+
+            return int(quote_response["outAmount"]) if is_buy else None
+
+# Run the bot
+async def main():
+    TOKEN_ADDRESS = "<SOLANA_DEVNET_TOKEN_ADDRESS>"  # Replace with a Devnet token mint
+    await price_monitor(TOKEN_ADDRESS)
+
+if __name__ == "__main__":
+    asyncio.run(main())
